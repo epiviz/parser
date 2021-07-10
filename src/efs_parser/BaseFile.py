@@ -12,6 +12,9 @@ import http
 import requests
 import ssl
 import time
+import boto3
+from botocore import UNSIGNED
+from botocore.client import Config
 
 __author__ = "Jayaram Kancherla"
 __copyright__ = "jkanche"
@@ -25,7 +28,7 @@ class BaseFile(object):
 
     Args:
         file: file location
-    
+
     Attributes:
         local: if file is local or hosted on a public server
         endian: check for endianess
@@ -38,7 +41,11 @@ class BaseFile(object):
 
     def __init__(self, file):
         self.file = file
-        self.local = self.is_local(file)
+        self.bucketname = None
+        self.region_name = None
+        self.file_source = self.get_file_source(file)
+        if self.file_source=="s3":
+            self.bucketname, self.region_name, self.file  = self.split_s3_components(file)
         self.endian = "="
         self.compressed = True
         self.conn = None
@@ -47,7 +54,24 @@ class BaseFile(object):
         }
         self.byteRanges = {}
 
-    def is_local(self, file):
+    def split_s3_components(self,filename):
+        phase1 = filename.replace("s3://", "")
+        region_start = phase1.find("@")
+        if region_start == -1:
+            raise Exception('Invalid S3 file name - missing region name')
+        file_name_start = phase1.find("/")
+        if file_name_start == -1:
+            raise Exception('Invalid S3 file name - missing file name')
+        bucket_name = phase1[:file_name_start]
+        file_name = phase1[file_name_start + 1:region_start]
+        if file_name == "":
+            raise Exception('Invalid S3 file name - missing file name')
+        region = phase1[region_start + 1:]
+        if region == "":
+            raise Exception('Invalid S3 file name - missing region name')
+        return bucket_name, region, file_name
+
+    def get_file_source(self, file):
         """
         Checks if file is local or hosted publicly
 
@@ -55,8 +79,11 @@ class BaseFile(object):
             file: location of file
         """
         if "http://" in file or "https://" in file or "ftp://" in file:
-            return False
-        return True
+            return "http"
+        elif "s3://" in file:
+            return "s3"
+        else:
+            return "local"
 
     def parse_header(self):
         raise Exception("NotImplementedException")
@@ -81,7 +108,7 @@ class BaseFile(object):
         Args:
             data: any data object to encode
 
-        Returns: 
+        Returns:
             data encoded as JSON
         """
         return ujson.dumps(data)
@@ -115,13 +142,16 @@ class BaseFile(object):
         Returns:
             binary string from file
         """
-        if self.local:
+        if self.file_source == "local":
             f = open(self.file, "rb")
             f.seek(offset)
             bin_value = f.read(size)
             f.close()
             return bin_value
-        else:
+        elif self.file_source == "s3":
+            response = self.get_bytes_from_s3(offset, size)
+            return response
+        elif self.file_source == "http":
             headers = {"Range": "bytes=%d-%d" % (offset, offset+size) }
 
             if not hasattr(self, 'conn') or self.conn is None:
@@ -135,13 +165,22 @@ class BaseFile(object):
                 # connection redirected and found resource - usually https
                 new_loc = response.getheader("Location")
                 # print("url redirected & found ", new_loc)
-                self.parse_url(new_loc)    
+                self.parse_url(new_loc)
                 self.conn.request("GET", url=self.fuparse.path, headers=headers)
-                response = self.conn.getresponse()    
-                resp = response.read()    
+                response = self.conn.getresponse()
+                resp = response.read()
             else:
                 resp = response.read()
-            return resp[:size]       
+            return resp[:size]
+
+    def get_bytes_from_s3(self, offset, size):
+        s3client = boto3.client('s3', region_name=self.region_name, config=Config(signature_version=UNSIGNED))
+        #key = self.file.replace(f"s3://{self.bucketname}/","")
+        key = self.file
+        bytes_range = "bytes=%d-%d" % (offset, offset+size)
+        resp = s3client.get_object(Bucket=self.bucketname,Key=key,Range=bytes_range)
+        data = resp['Body'].read()
+        return data[:size]
 
     def get_bytes(self, offset, size):
         """Get bytes within a given range [offset:offset+size]
@@ -153,13 +192,16 @@ class BaseFile(object):
         Returns:
             bytes from offset to (offset + size)
         """
-        if self.local:
+        if self.file_source == "local":
             f = open(self.file, "rb")
             f.seek(offset)
             bin_value = f.read(size)
             f.close()
             return bin_value
-        else:
+        elif self.file_source == "s3":
+            response = self.get_bytes_from_s3(offset,size)
+            return response
+        elif self.file_source == "http":
             headers = {"Range": "bytes=%d-%d" % (offset, offset+size) }
 
             start = time.time()
